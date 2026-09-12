@@ -395,7 +395,7 @@ function rememberStreamIndex(state, key, index) {
   return true;
 }
 
-function normalizeResponsesEvent(frame, state, flatToNative) {
+function normalizeResponsesEvent(frame, state, flatToNative, mapPayload) {
   const data = frameData(frame);
   state.sawEvent = true;
   if (state.invalid) return "";
@@ -411,6 +411,7 @@ function normalizeResponsesEvent(frame, state, flatToNative) {
     return serializeFrame(frame, data);
   }
   if (!data || typeof data !== "object" || Array.isArray(data)) return serializeFrame(frame, data);
+  if (mapPayload) mapPayload(data);
   if (typeof data.type === "string" && TERMINAL_EVENTS.has(data.type)) state.terminal = true;
   if (data.type === "response.created") {
     const responseId = data.response?.id || data.response_id;
@@ -482,7 +483,7 @@ function normalizeResponsesEvent(frame, state, flatToNative) {
   return serializeFrame(frame, data);
 }
 
-export function createResponsesStreamTransform(flatToNative = new Map()) {
+export function createResponsesStreamTransform(flatToNative = new Map(), mapPayload) {
   let buffer = "";
   const state = streamState();
   const decoder = new TextDecoder();
@@ -499,7 +500,7 @@ export function createResponsesStreamTransform(flatToNative = new Map()) {
           const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary.length);
           if (frame.trim()) {
-            const normalized = normalizeResponsesEvent(parseFrame(frame), state, flatToNative);
+            const normalized = normalizeResponsesEvent(parseFrame(frame), state, flatToNative, mapPayload);
             if (normalized) this.push(normalized);
           }
         }
@@ -512,7 +513,7 @@ export function createResponsesStreamTransform(flatToNative = new Map()) {
       try {
         buffer += decoder.decode();
         if (buffer.trim()) {
-          const normalized = normalizeResponsesEvent(parseFrame(buffer), state, flatToNative);
+          const normalized = normalizeResponsesEvent(parseFrame(buffer), state, flatToNative, mapPayload);
           if (normalized) this.push(normalized);
         }
         if (state.sawEvent && !state.terminal && !state.invalid) {
@@ -531,7 +532,7 @@ export function createResponsesStreamTransform(flatToNative = new Map()) {
   });
 }
 
-export function createResponsesJsonTransform(flatToNative = new Map()) {
+export function createResponsesJsonTransform(flatToNative = new Map(), mapPayload) {
   let body = "";
   return new Transform({
     transform(chunk, _encoding, callback) {
@@ -547,7 +548,8 @@ export function createResponsesJsonTransform(flatToNative = new Map()) {
         return;
       }
       try {
-        this.push(JSON.stringify(normalizeResponseBody(parsed, flatToNative)));
+        const normalized = normalizeResponseBody(parsed, flatToNative);
+        this.push(JSON.stringify(mapPayload ? mapPayload(normalized) : normalized));
       } catch (error) {
         callback(error);
         return;

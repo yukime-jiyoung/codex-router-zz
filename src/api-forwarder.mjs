@@ -1,3 +1,4 @@
+import { MUSE_FREE_ID, isMuseFree, museFreeHeaders, museFreePreflight, museFreeOutputMarker } from "./muse-free.mjs";
 import http from "node:http";
 
 import {
@@ -423,6 +424,115 @@ function flattenRecursiveToolSchemas(payload, protocol) {
   );
 }
 
+// OpenCode Zen's paid Responses endpoint enforces the OpenAI strict-mode
+// precondition -- `required` must name every key in `properties` -- against
+// every function tool it is handed, and Codex's MCP-derived schemas cannot
+// satisfy it because they have genuinely optional arguments. Measured
+// 2026-09-08 against POST https://opencode.ai/zen/v1/responses with four live
+// requests that differed only in the flag and the `required` list: a flat
+// schema declaring `required: ["site_id"]` beside an optional `limit` property
+// returned 200; the identical schema carrying `strict: true` returned
+//
+//   HTTP 400 {"param":"parameters","type":"invalid_request_error",
+//   "message":"'required' is required to be supplied and to be an array
+//   including every key in properties. Missing 'limit'."}
+//
+// and the same `strict: true` request returned 200 again once `required`
+// listed every property. A nested object with partial `required` at both
+// levels and no flag was also accepted, so the trigger is the flag and not the
+// shape of the schema.
+//
+// Codex sets `strict: true` on its tools and `normalizeTool` in
+// openai-adapters.mjs passes it through unchanged, so there are two ways to
+// satisfy this validator and only one of them is honest. Filling `required`
+// with every property is the other one: it would make `limit`, `offset`, and
+// `sortBy` mandatory on every call, so the model has to invent a value for
+// each argument the caller declared optional, and tool calling degrades on a
+// route that was working. Removing the flag leaves the caller's schema
+// semantics exactly as written and gives up only the structured-output
+// guarantee this endpoint was never honouring in the first place -- it refused
+// the whole request rather than enforcing anything. The flag is removed
+// whenever it is present rather than only when it is `true`, because an absent
+// flag and `strict: false` are the same request to an OpenAI-compatible
+// validator, which keeps this one rule instead of two.
+// Console applies the OpenAI strict-mode precondition to a native tool entry
+// -- one whose `type` is something other than `function`, such as Codex's
+// client-executed `tool_search` -- whether or not any `strict` flag is
+// present, and there is nothing to drop on those. Measured against
+// https://opencode.ai/zen/v1/responses on 2026-09-08: a `tool_search` entry
+// whose `parameters` declare `query` and `limit` but name only `query` in
+// `required` is refused with `Missing 'limit'`, and the identical entry with
+// both names in `required` is accepted. Naming every property is the only
+// repair available here, and unlike a function tool it costs nothing the
+// caller can observe: these schemas belong to the client's own control
+// surface rather than to a user-authored tool, so an argument becoming
+// mandatory changes which values the model must supply and never which tools
+// it can reach. Function tools are deliberately left alone -- dropping their
+// flag already satisfies the same validator while keeping genuinely optional
+// arguments optional.
+function requireEveryProperty(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema;
+  let repaired = schema;
+  const properties = schema.properties;
+  if (properties && typeof properties === "object" && !Array.isArray(properties)) {
+    const names = Object.keys(properties);
+    const current = Array.isArray(schema.required) ? schema.required : [];
+    if (names.length > 0 && names.some((name) => !current.includes(name))) {
+      repaired = { ...repaired, required: names };
+    }
+    for (const name of names) {
+      const child = requireEveryProperty(properties[name]);
+      if (child === properties[name]) continue;
+      repaired = {
+        ...repaired,
+        properties: { ...(repaired.properties || properties), [name]: child },
+      };
+    }
+  }
+  const items = requireEveryProperty(schema.items);
+  if (items !== schema.items) repaired = { ...repaired, items };
+  return repaired;
+}
+
+function dropStrictToolFlags(payload, protocol) {
+  if (!Array.isArray(payload.tools)) return;
+  let changed = false;
+  const tools = payload.tools.map((tool) => {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return tool;
+    if (tool.type !== "function") {
+      // A native entry carries no flag to drop, so the one validator has to be
+      // satisfied the other way. See `requireEveryProperty` above.
+      const filled = requireEveryProperty(tool.parameters);
+      if (filled === tool.parameters) return tool;
+      changed = true;
+      return { ...tool, parameters: filled };
+    }
+    if (protocol === "openai-responses") {
+      // On the Responses wire the flag sits on the tool itself, beside
+      // `name` and `parameters`, rather than inside a `function` object.
+      if (!("strict" in tool)) return tool;
+      changed = true;
+      const { strict: _toolStrict, ...rest } = tool;
+      return rest;
+    }
+    const fn = tool.function;
+    if (!fn || typeof fn !== "object" || Array.isArray(fn)) return tool;
+    if (!("strict" in fn)) return tool;
+    changed = true;
+    const { strict: _functionStrict, ...repaired } = fn;
+    return { ...tool, function: repaired };
+  });
+  if (!changed) return;
+  payload.tools = tools;
+  // Never quieted: a tool the model may call has lost the generation guarantee
+  // the caller asked for, and an unattended service is exactly where that must
+  // not be silent.
+  console.error(
+    "[api-forwarder] relaxed strict-mode tool validation for this request: dropped the " +
+      "flag from function tool(s), named every property in required on native tool(s)",
+  );
+}
+
 // A trailing model turn is a destructive rewrite: it discards part of the
 // caller's conversation. Only Google's own provider gets that behavior from
 // identity. Resellers and custom endpoints must opt in per model after their
@@ -788,7 +898,7 @@ function normalizeBody(buffer, contentType, route) {
   // tool boundary applied in the router before this hop. A caller that does send
   // Meta a real `web_search_preview` tool keeps the field, because that is the
   // one tool this endpoint accepts it on.
-  if (provider.id === "meta" && Array.isArray(payload.tools)) {
+  if ((provider.id === "meta" || isMuseFree(model)) && Array.isArray(payload.tools)) {
     payload.tools = stripSearchContentTypes(payload.tools);
   }
   // Strip empty tools array and dangling tool_choice for all routes.
@@ -848,6 +958,14 @@ function normalizeBody(buffer, contentType, route) {
   // express.
   if (model.toolSchemaRecursion === "flatten") {
     flattenRecursiveToolSchemas(payload, provider.protocol);
+  }
+  // Its own statement for the same reason, and this route is the proof that
+  // the reason holds: paid Zen Muse Spark 1.3 already spends its single
+  // `requestProfile` on `auto-tool-choice` and already needs
+  // `toolSchemaRecursion`, so a third independently measured upstream repair
+  // could not have been a branch of either chain.
+  if (model.toolStrictMode === "drop") {
+    dropStrictToolFlags(payload, provider.protocol);
   }
   if (model.requestProfile === "clinepass") {
     delete payload.reasoning_effort;
@@ -1086,6 +1204,9 @@ function normalizeBody(buffer, contentType, route) {
 }
 
 function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = {}, endpoint = provider) {
+  if (provider.id === "opencode-zen-responses" && JSON.parse(body.toString()).model === MUSE_FREE_ID) {
+    return museFreeHeaders(requestHeaders, apiKey, VERSION);
+  }
   const headers = {};
   const providerIdentityHeaders = new Set([
     "copilot-integration-id",
@@ -1156,9 +1277,10 @@ async function relayUpstreamResponse(
     ? buildNamespaceLookupsFromTools(normalized.payload?.tools)
     : new Map();
   
+  const mapPayload = isMuseFree(normalized.model) ? museFreeOutputMarker() : undefined;
   const transform = [
-    responsesStream ? createResponsesStreamTransform(flatToNative) : undefined,
-    responsesJson ? createResponsesJsonTransform(flatToNative) : undefined,
+    responsesStream ? createResponsesStreamTransform(flatToNative, mapPayload) : undefined,
+    responsesJson ? createResponsesJsonTransform(flatToNative, mapPayload) : undefined,
     zaiCacheUsageTransform(normalized.provider.id, upstreamContentType),
   ].filter(Boolean);
   const denylist = transform.length
@@ -1304,6 +1426,9 @@ async function handleRequest(request, response) {
 
   const original = await readRequestBody(request);
   const normalized = normalizeBody(original, request.headers["content-type"], route);
+  if (normalized.provider.id === "opencode-zen-responses" && normalized.model.upstreamModel === MUSE_FREE_ID) {
+    museFreePreflight(normalized.payload, request.headers);
+  }
   const controller = new AbortController();
   request.once("aborted", () => controller.abort());
   response.once("close", () => {
@@ -1732,7 +1857,7 @@ const server = http.createServer((request, response) => {
     );
     if (!response.headersSent) {
       writeJson(response, status, {
-        error: transport || {
+        error: (error.code === "muse_free_thread_id_required" || error.code === "muse_free_nonportable_history") ? { type: error.code, message: error.message } : transport || {
           type: "provider_api_proxy_error",
           message: "The API-provider forwarder could not complete the request.",
         },

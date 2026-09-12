@@ -1,3 +1,4 @@
+import { isMuseFree, museFreeSessionId, museFreePreflight, museFreePortableInput } from "./muse-free.mjs";
 import { readFileSync } from "node:fs";
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
@@ -21,6 +22,7 @@ import {
   COMPACTION_PROMPT,
   encodeCheckpoint,
   finalizeCheckpoint,
+  strictFinalizeCheckpoint,
   isRouterCompactionValue,
   LEGACY_V1_SUMMARY_PREFIX,
   LEGACY_WARNING,
@@ -98,6 +100,7 @@ import {
   readProviderSelection,
   selectedConfiguredListedModels,
 } from "./provider-selection.mjs";
+import { effectiveProviderCredentialStatus } from "./provider-api-key-routing.mjs";
 import {
   estimateInputTokens,
   mergeTokenUsage,
@@ -896,12 +899,94 @@ function assertRoutedSearchContract(route, builtSearchMode, contract) {
 // tool/input limitations do not establish a contract for paid Zen, Go, or any
 // other free model, so keep this compatibility boundary exact.
 function needsZenFreeToolCompatibility(route) {
+  if (isMuseFree(route)) return true;
   const providerId = providerForModel(route)?.id;
   return (
     (providerId === "opencode-free-responses" &&
       (route.upstreamModel === "muse-spark-1.2-contributor-free" ||
         route.upstreamModel === "muse-spark-1.3-contributor-free"))
   );
+}
+
+// Codex records a no-argument tool call as `arguments: ""`, which OpenAI
+// accepts. The OpenCode Zen Responses endpoint answers HTTP 400 `arguments
+// must be valid JSON` for that and for whitespace alone, while `"{}"` returns
+// 200 -- measured 2026-09-11 for both muse-spark-1.3-contributor-free and the
+// paid muse-spark-1.3, so this is the endpoint rather than one model. A single
+// such call ends the conversation, because the item is replayed on every later
+// turn. Every body built for that endpoint goes through here: the routed turn
+// and the compaction build their input separately, and repairing only the
+// first left compaction failing on exactly this.
+//
+// Only the empty case is rewritten. Any other malformed value is the caller's
+// own content, and guessing at it would hide a real defect.
+// The one place every outbound routed body passes through before it is
+// serialized. The routed turn and the compaction each build their own body,
+// and repairing only one of them is exactly how `stream_options` and empty
+// tool arguments both reached production twice: fixed on one path, still
+// failing on the other. Anything that is true of every body this router
+// sends upstream belongs here, and an invariant living anywhere else will be
+// missed by whichever path is added next.
+function finalizeOutboundBody(body, route) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  // `stream_options` only describes a stream. Carried onto a body that is
+  // not streamed it is a contradiction the endpoint is entitled to reject:
+  // OpenCode Zen answers HTTP 400 `stream_options requires stream to be
+  // true` -- measured 2026-09-11, and the only difference between a
+  // compaction that passes and one that does not.
+  if (body.stream !== true && body.stream_options !== undefined) {
+    delete body.stream_options;
+  }
+  // Codex records a no-argument tool call as `arguments: ""`, which OpenAI
+  // accepts. The Zen Responses endpoint answers HTTP 400 `arguments must be
+  // valid JSON` for that and for whitespace alone, while `"{}"` returns 200
+  // -- measured 2026-09-11 against both the free and the paid Muse, so this
+  // is the endpoint rather than one model. A single such call ends the whole
+  // conversation, because the item is replayed on every later turn.
+  //
+  // Only the empty case is rewritten. Any other malformed value is the
+  // caller\'s own content, and guessing at it would hide a real defect.
+  const provider = providerForModel(route)?.id;
+  if (
+    Array.isArray(body.input)
+    && (needsZenFreeToolCompatibility(route) || provider === "opencode-zen-responses")
+  ) {
+    let repaired = false;
+    const input = body.input.map((item) => {
+      if (item?.type !== "function_call" || typeof item.arguments !== "string") return item;
+      if (item.arguments.trim()) return item;
+      repaired = true;
+      return { ...item, arguments: "{}" };
+    });
+    if (repaired) body.input = input;
+  }
+  return body;
+}
+
+// Never quieted. An upstream refusal that the router merely relays is the
+// one class of failure that leaves no trace on this side: the status reaches
+// the timing line, the body reaches Codex, and nothing reaches the log. That
+// is why the compaction 400s of 2026-09-10 could not be explained a day
+// later. Shape and text only -- the excerpt is truncated and anything
+// token-shaped is removed, so no credential can ride along.
+function logUpstreamRejection(stage, route, status, payload) {
+  if (!Number.isInteger(status) || status < 400) return;
+  let excerpt;
+  try {
+    excerpt = typeof payload === "string" ? payload : JSON.stringify(payload);
+  } catch {
+    excerpt = "<unserializable>";
+  }
+  excerpt = String(excerpt ?? "")
+    .replace(/(sk|xai|gsk|Bearer|token|secret|key)[-_ :]*[A-Za-z0-9_-]{12,}/gi, "$1 [redacted]")
+    .slice(0, 400);
+  process.stderr.write(`${JSON.stringify({
+    upstreamRejected: stage,
+    model: route?.slug,
+    provider: route?.provider,
+    status,
+    excerpt,
+  })}\n`);
 }
 
 // Console Go's Responses endpoint is Responses-shaped but implements only the
@@ -1317,6 +1402,34 @@ async function healthPayload() {
 function routeProviderEnabled(providerId) {
   const provider = RUNTIME_PROVIDERS.get(providerId);
   return provider?.generic === true || readProviderSelection().includes(providerId);
+}
+
+// Substituting the portable checkpoint changes how a GPT-only conversation is
+// compacted, so it must not happen for a model that could never receive one.
+// Provider selection alone does not answer that: it records that a provider is
+// wanted, not that it is usable. Four routing tests fail when the catalog
+// merely mentioning a Free route is enough to rewrite native compaction.
+//
+// The checks run cheapest first, because this sits in the request path.
+// `selectedConfiguredListedModels()` would answer the same question in one
+// call and is what the failover paths use, but it probes every provider
+// synchronously -- on macOS one Keychain spawn per provider -- and the vision
+// bridge was rewritten specifically to keep that out of the hot path. Asking
+// about one provider reaches the Keychain only when nothing else answered,
+// and only for an install that selected this provider without a credential.
+function museFreeCanReceiveHistory() {
+  const free = [...MODEL_BY_SLUG.values()].find(isMuseFree);
+  if (!free) return false;
+  if (!routeProviderEnabled(free.provider)) return false;
+  const provider = providerForModel(free);
+  if (!provider) return false;
+  try {
+    return effectiveProviderCredentialStatus(provider, { persistent: true }).configured === true;
+  } catch {
+    // An unknown or non-API-key provider cannot hold a credential for this
+    // route, which is the same answer as an unconfigured one.
+    return false;
+  }
 }
 
 function messageItem(text) {
@@ -2292,6 +2405,7 @@ function normalizeNativeInput(
   { statelessReasoning = false, dropUnstoredReasoningReferences = false } = {},
 ) {
   if (!Array.isArray(input)) return input;
+  input = museFreePortableInput(input, { native: true });
   return input.flatMap((item) => {
     if (item?.type === "reasoning") {
       const reasoning = sanitizeReasoningForNative(item, {
@@ -2525,7 +2639,7 @@ async function summarizeWith(
   // is unrelated to the compaction body.
   if (rejectsWebSearchOptions(route)) delete body.web_search_options;
   const searchCompatibility = routedSearchCompatibility(body, route);
-  const serialized = JSON.stringify(searchCompatibility.payload);
+  const serialized = JSON.stringify(finalizeOutboundBody(searchCompatibility.payload, route));
   // Candidate capability may depend on a sidecar credential or binding that
   // changed while image bridging was in flight. Preserve both the mode used
   // to construct this exact body and the live mode at the send boundary: a
@@ -2536,9 +2650,11 @@ async function summarizeWith(
   ) {
     return { searchCapabilityChanged: true };
   }
-  const upstream = await fetch(`${GATEWAY_BASE}/responses`, {
+  const upstream = await fetch(`${isMuseFree(route) ? API_BASE : GATEWAY_BASE}/responses`, {
     method: "POST",
-    headers: routedHeaders(),
+    headers: isMuseFree(route)
+      ? { ...routedHeaders(), "thread-id": museFreeSessionId(request.headers) }
+      : routedHeaders(),
     body: serialized,
     signal,
   });
@@ -2659,7 +2775,7 @@ async function summarize(request, payload, route, signal, { allowFailover = true
       }
       return {
         ok: true,
-        checkpoint: finalizeCheckpoint(answer, prepared),
+        checkpoint: isMuseFree(attemptRoute) ? strictFinalizeCheckpoint(answer, prepared) : finalizeCheckpoint(answer, prepared),
         input: originalInput,
         usage,
         toolResultAging: aged.stats,
@@ -2728,6 +2844,43 @@ function recordCompactionUsage(result, route, startedAt) {
   });
 }
 
+// Native opaque checkpoints cannot be replayed to Free. When Free is enabled,
+// use the selected GPT itself to produce the existing portable checkpoint format.
+async function nativePortableCompaction(request, response, payload, signal, v2) {
+  const input = normalizeNativeInput(payload.input).filter(item => !["compaction_trigger", "additional_tools"].includes(item.type));
+  const prepared = prepareCompaction(input);
+  const body = {...payload, model:nativeContextVariantBase(payload.model) || payload.model,
+    input:[...input, messageItem(prepared.catalogText), messageItem(COMPACTION_PROMPT)],
+    tools:[], parallel_tool_calls:false, stream:true, store:false};
+  for (const key of ["previous_response_id", "tool_choice", "client_metadata", "prompt_cache_key"]) delete body[key];
+  const headers = nativeHeaders(request);
+  const upstream = await fetch(nativeTarget("/responses"), {method:"POST",headers,body:JSON.stringify(body),signal});
+  const bytes = await readResponseBody(upstream, {maxBytes:32*1024*1024,signal});
+  if (!upstream.ok) {
+    response.writeHead(upstream.status, {"content-type":upstream.headers.get("content-type") || "application/json"});response.end(bytes);
+    return {status:upstream.status};
+  }
+  let completed; const output=[];
+  for (const frame of bytes.toString("utf8").split(/\r?\n\r?\n/)) {
+    const data = frame.split(/\r?\n/).filter(line=>line.startsWith("data:")).map(line=>line.slice(5).trimStart()).join("\n");
+    if (!data || data === "[DONE]") continue;
+    const event = JSON.parse(data);
+    if (event.type === "response.failed" || event.type === "response.incomplete") throw Object.assign(new Error("Compaction did not complete; original history was retained."), {status:502});
+    if (event.type === "response.output_item.done") {
+      const index=event.output_index ?? output.length;
+      if (!Number.isInteger(index) || index < 0 || index >= 4096) throw Object.assign(new Error("Invalid compaction output index; history retained."),{status:502});
+      output[index]=event.item;
+    }
+    if (event.type === "response.completed") completed = event.response;
+  }
+  if (!completed || completed.status !== "completed") throw Object.assign(new Error("Missing completed compaction response; original history was retained."), {status:502});
+  const checkpoint = strictFinalizeCheckpoint(extractResponseText({...completed,output:completed.output?.length ? completed.output : output.filter(Boolean)}),prepared);
+  if (v2 && payload.stream !== false) writeCompactionSse(response,payload.model,checkpoint);
+  else if (v2) writeJson(response,200,compactionSnapshot(payload.model,{type:"compaction",id:`cmp_${randomUUID().replaceAll("-","")}`,encrypted_content:encodeCheckpoint(checkpoint)}));
+  else writeJson(response,200,{output:compactOutput(input,checkpoint)});
+  return {status:200,usage:tokenUsageFromPayload(completed)};
+}
+
 function compactionSnapshot(model, item, status = "completed") {
   return {
     id: `resp_${randomUUID().replaceAll("-", "")}`,
@@ -2783,6 +2936,7 @@ async function handleRoutedCompaction(
     ...(result.failoverFrom ? { failoverFrom: result.failoverFrom } : {}),
   };
   if (!result.ok) {
+    logUpstreamRejection("compaction", result.route || route, result.status, result.payload);
     writeJson(response, result.status, result.payload);
     return {
       status: result.status,
@@ -2961,6 +3115,7 @@ function observeSubagentOutcome(request, route, status, options = {}) {
 // `agedInput`. The tool list is a local, and the input array is copied before
 // anything rewrites it.
 async function buildRoutedRequest({ request, payload, route, agedInput }) {
+  if (isMuseFree(route)) museFreeSessionId(request.headers);
   const searchCompatibility = routedSearchCompatibility(payload, route);
   payload = searchCompatibility.payload;
   let namespacesFlattened = false;
@@ -3106,7 +3261,16 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     // function tools are repaired in the exact shape the endpoint validates.
     tools = repairToolSchemaRoots(tools, { nonRecursive: true });
   }
-  if (needsStrictOpenCodeToolCompatibility(route)) {
+  // Measured 2026-09-08: POST https://opencode.ai/zen/v1/responses with
+  // muse-spark-1.3 rejects web_search.search_content_types with HTTP 400;
+  // removing only that field returns 200 and keeps web_search available.
+  // Free returns the same schema error (2026-09-10). Apply this repair to both,
+  // not the custom-tool bridge below
+  // or the broader Go/Free compatibility rules. Other paid models are unproven.
+  if (
+    isMuseFree(route) || needsStrictOpenCodeToolCompatibility(route) ||
+    (provider?.id === "opencode-zen-responses" && route.upstreamModel === "muse-spark-1.3")
+  ) {
     tools = stripSearchContentTypes(tools);
   }
   if (needsMoonshotSchemaCompatibility(route)) {
@@ -3229,9 +3393,13 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   }
   if (rejectsWebSearchOptions(route)) delete routed.web_search_options;
   return {
-    body: Buffer.from(JSON.stringify(routed), "utf8"),
-    target: `${GATEWAY_BASE}/responses`,
-    headers: routedHeaders(),
+    body: Buffer.from(JSON.stringify(finalizeOutboundBody(routed, route)), "utf8"),
+    // Responses needs no protocol conversion here. Keep the thread header
+    // on the existing API forwarder hop instead of losing it in LiteLLM.
+    target: `${isMuseFree(route) ? API_BASE : GATEWAY_BASE}/responses`,
+    headers: isMuseFree(route)
+      ? { ...routedHeaders(), "thread-id": museFreeSessionId(request.headers) }
+      : routedHeaders(),
     // The exact mode used while constructing this body. Failover compares it
     // with the immutable source contract as well as live state immediately
     // before send, so transient sidecar changes cannot validate stale bytes.
@@ -3281,6 +3449,7 @@ async function prepareRoutedRequest({
 // `/usr/bin/security` per keychain service on macOS, which would cost every
 // healthy turn about 250ms of blocked event loop for nothing.
 function failoverCandidates({ route, agedInput, flattenedNamespaces, searchContract, chain }) {
+  if (isMuseFree(route)) return [];
   const hidden = readHiddenModels();
   return rankFailoverCandidates(
     selectedConfiguredListedModels().filter((model) => (
@@ -3394,7 +3563,7 @@ async function attemptModelFailover({
   searchContract,
 }) {
   const settings = readFailoverSettings();
-  if (!settings.enabled) return undefined;
+  if (!settings.enabled || isMuseFree(route)) return undefined;
   const transportFallback = verdict.reason === "transport";
   const candidates = transportFallback
     ? subagentTransportFailoverCandidates({
@@ -3589,6 +3758,7 @@ async function handleResponses(request, response, requestUrl) {
       });
       return;
     }
+    if (isMuseFree(route)) museFreePreflight(payload, request.headers);
     // Anything without a route from here on is native GPT traffic. An install
     // that merely hid every provider keeps its native passthrough -- that has
     // always worked -- but an idle --no-discovery install answers locally.
@@ -3614,7 +3784,12 @@ async function handleResponses(request, response, requestUrl) {
       Array.isArray(payload.input) &&
       payload.input.at(-1)?.type === "compaction_trigger";
 
-    if (route && !directResponses && (compactV1 || compactV2)) {
+    if (!route && (compactV1 || compactV2) && museFreeCanReceiveHistory()) {
+      const result = await nativePortableCompaction(request,response,payload,controller.signal,compactV2);
+      usage = result.usage; finalStatus = activityStatus = result.status;
+      return;
+    }
+    if (route && (!directResponses || isMuseFree(route)) && (compactV1 || compactV2)) {
       const compaction = await handleRoutedCompaction(
         request,
         response,
@@ -3622,7 +3797,7 @@ async function handleResponses(request, response, requestUrl) {
         route,
         controller.signal,
         compactV2,
-        { allowFailover: !exactRouteProbe },
+        { allowFailover: !exactRouteProbe && !isMuseFree(route) },
       );
       const compacted = compaction.route || route;
       recordCompactionUsage(compaction, route, startedAt);
@@ -3724,7 +3899,7 @@ async function handleResponses(request, response, requestUrl) {
       // less than the request it avoids. The cooldown expires by itself, so
       // the operator's chosen model comes back without anyone doing anything.
       const settings = readFailoverSettings();
-      const cooled = !exactRouteProbe && settings.enabled
+      const cooled = !exactRouteProbe && !isMuseFree(route) && settings.enabled
         ? providerCooldown(route.provider)
         : undefined;
       if (cooled) {
@@ -3886,12 +4061,13 @@ async function handleResponses(request, response, requestUrl) {
         MAX_BUFFERED_RESPONSE_BYTES,
         controller.signal,
       );
+      logUpstreamRejection("routed-turn", route, upstream.status, failedBodyText);
       const verdict = classifyRoutedFailure({
         status: upstream.status,
         bodyText: failedBodyText,
         retryAfterSeconds: retryAfterSeconds(upstream.headers),
       });
-      if (verdict.swap && !exactRouteProbe) {
+      if (verdict.swap && !exactRouteProbe && !isMuseFree(route)) {
         // Believe the provider about when it will be back before trying anyone
         // else, so the next turn skips it instead of paying for the same
         // rejection again.
@@ -4488,7 +4664,7 @@ async function handleResponses(request, response, requestUrl) {
       usageRecorded = true;
       return;
     }
-    if (error?.code === "model_search_not_supported" && !response.headersSent) {
+    if ((error?.code === "model_search_not_supported" || error?.code === "muse_free_thread_id_required" || error?.code === "muse_free_nonportable_history") && !response.headersSent) {
       finalStatus = error.status;
       activityStatus = error.status;
       writeJson(response, error.status, {

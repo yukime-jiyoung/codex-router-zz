@@ -4954,6 +4954,186 @@ test("API forwarder strips Codex schema annotations only for an explicitly profi
 });
 
 
+// The strict flag is opted into per model, so the fixture needs a chat route
+// that carries the opt-in and a sibling on the same reseller that does not:
+// the restriction belongs to the upstream behind the reseller, and a transform
+// scoped any wider would strip a documented parameter from routes nobody
+// measured. The Responses half of this coverage uses the checked-in paid Zen
+// and Console Go routes instead of a fixture, because on that wire the flag
+// sits on the tool itself rather than inside `function`, and that position is
+// worth proving against a real registry entry.
+function curatedStrictToolModels() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "routing-strict-tool-models-"));
+  const file = path.join(dir, "user-models.json");
+  const entry = (upstreamModel, gatewayModel, extra) => ({
+    slug: `openrouter/${upstreamModel}`,
+    gatewayModel,
+    upstreamModel,
+    provider: "openrouter",
+    listed: true,
+    displayName: `${upstreamModel} (curated)`,
+    description: "Test fixture.",
+    priority: 500,
+    defaultEffort: "high",
+    reasoningLevels: [{ effort: "high", description: "Adaptive reasoning" }],
+    contextWindow: 131072,
+    autoCompact: 110000,
+    inputModalities: ["text"],
+    compHash: `${gatewayModel}-user-v1`,
+    ...extra,
+  });
+  writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      models: [
+        entry("vendor/strict-tools", "openrouter-vendor-strict-tools", {
+          toolStrictMode: "drop",
+        }),
+        entry("vendor/ordinary-tools", "openrouter-vendor-ordinary-tools", {}),
+      ],
+    }),
+    "utf8",
+  );
+  return {
+    dir,
+    file,
+    dropsStrict: "openrouter-vendor-strict-tools",
+    keepsStrict: "openrouter-vendor-ordinary-tools",
+  };
+}
+
+test("API forwarder drops the strict tool flag only where a model opted in", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ url: request.url, body: await bodyJson(request) });
+    if (request.url.endsWith("/responses")) {
+      json(response, 200, {
+        id: "resp_test",
+        object: "response",
+        status: "completed",
+        model: "test",
+        output: [],
+      });
+      return;
+    }
+    json(response, 200, { choices: [] });
+  });
+  const curated = curatedStrictToolModels();
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    OPENROUTER_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    OPENROUTER_API_KEY: "TEST_OPENROUTER_API_KEY",
+    OPENCODE_ZEN_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    OPENCODE_GO_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    OPENCODE_API_KEY: "TEST_OPENCODE_API_KEY",
+    OPENCODE_GO_API_KEY: "TEST_OPENCODE_API_KEY",
+    // Set deliberately: the transform's own line is not gated on it, and the
+    // count asserted at the end of this test is what says so.
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const headers = {
+    Authorization: `Bearer ${INTERNAL_KEY}`,
+    "Content-Type": "application/json",
+  };
+  // The measured shape: one required property beside a genuinely optional
+  // one. Filling `required` would satisfy the same validator by making
+  // `limit` mandatory, which is why this schema has to arrive unchanged.
+  const parameters = {
+    type: "object",
+    properties: {
+      site_id: { type: "string" },
+      limit: { type: "integer" },
+    },
+    required: ["site_id"],
+    additionalProperties: false,
+  };
+
+  const forwardChat = async (model, tools) => {
+    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model, messages: [{ role: "user", content: "test" }], tools }),
+    });
+    assert.equal(response.status, 200, forwarder.testErrors());
+    return upstreamRequests.at(-1).body.tools;
+  };
+
+  const forwardResponses = async (model, tools) => {
+    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model, input: "test", tools }),
+    });
+    assert.equal(response.status, 200, forwarder.testErrors());
+    return upstreamRequests.at(-1).body.tools;
+  };
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+
+    // Chat Completions: the flag sits inside `function`, and only the flag
+    // goes. The name, the description, and the caller's partial `required` all
+    // reach the upstream exactly as sent.
+    const chatTool = {
+      type: "function",
+      function: { name: "search", description: "Search a site.", parameters, strict: true },
+    };
+    assert.deepEqual(await forwardChat(curated.dropsStrict, [chatTool]), [
+      {
+        type: "function",
+        function: { name: "search", description: "Search a site.", parameters },
+      },
+    ]);
+
+    // A sibling curated on the same provider keeps its flag, so strict mode is
+    // not taken away from every OpenRouter route to serve one upstream.
+    assert.deepEqual(await forwardChat(curated.keepsStrict, [chatTool]), [chatTool]);
+
+    // Responses: the flag sits on the tool itself. The checked-in paid Zen
+    // route is the one measured returning HTTP 400 for it.
+    const responsesTool = { type: "function", name: "search", parameters, strict: true };
+    assert.deepEqual(
+      await forwardResponses("opencode-zen-responses-muse-spark-1-3", [responsesTool]),
+      [{ type: "function", name: "search", parameters }],
+    );
+
+    // Console Go's Responses route has not established the same restriction,
+    // so it still sends the flag Codex asked for.
+    assert.deepEqual(
+      await forwardResponses("opencode-go-responses-gpt-5-6-luna", [responsesTool]),
+      [responsesTool],
+    );
+
+    // Nothing to repair: a tool list with no flag anywhere arrives unchanged
+    // on the very route that opted in, hosted-search and other non-function
+    // entries included. An unconditional rewrite would show up right here.
+    const untouched = [
+      { type: "function", name: "search", parameters },
+      { type: "web_search", search_context_size: "medium" },
+    ];
+    assert.deepEqual(
+      await forwardResponses("opencode-zen-responses-muse-spark-1-3", untouched),
+      untouched,
+    );
+
+    // Never quieted, and CODEX_ROUTER_QUIET is set above: a tool the model may
+    // call has lost the generation guarantee the caller asked for. Exactly the
+    // two rewrites above are announced, and the untouched payload is silent.
+    const announced =
+      forwarder.testErrors().match(/relaxed strict-mode tool validation/gu) || [];
+    assert.equal(announced.length, 2, forwarder.testErrors());
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(curated.dir, { recursive: true, force: true });
+  }
+});
+
 // The free Qwen3.8 community endpoint validates reasoning_effort against a
 // literal set and 400s on anything outside it. `ultra` is the one rung of the
 // Codex ladder that set omits, so the profile folds exactly that value and
@@ -7046,6 +7226,97 @@ test("API forwarder drops the search_content_types Meta refuses, and only for Me
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
+  }
+});
+
+test("paid Zen Muse search repair reaches the upstream without widening native tool compatibility", async () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "routing-paid-zen-search-"));
+  const userModels = path.join(testRoot, "user-models.json");
+  const paid = JSON.parse(readFileSync(
+    path.join(root, "config/opencode/zen-responses/muse-spark-1.3.json"), "utf8",
+  )).models[0];
+  const sibling = {
+    ...paid,
+    slug: "opencode-zen-responses/unmeasured-search",
+    upstreamModel: "unmeasured-search",
+    gatewayModel: "opencode-zen-responses-unmeasured-search",
+  };
+  writeFileSync(userModels, JSON.stringify({ version: 1, models: [sibling] }));
+  const received = [];
+  const upstream = await mockServer(async (request, response) => {
+    received.push(await bodyJson(request));
+    json(response, 200, {
+      id: "resp_search", object: "response", status: "completed", output: [],
+    });
+  });
+  const forwarderPort = await openPort();
+  const env = {
+    CODEX_HOME: path.join(testRoot, "codex"),
+    MODEL_ROUTER_STATE_DIR: testRoot,
+    MODEL_ROUTER_USER_MODELS: userModels,
+    OPENCODE_ZEN_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    OPENCODE_API_KEY: "TEST_OPENCODE_API_KEY",
+    OPENCODE_GO_API_KEY: "TEST_OPENCODE_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  };
+  const forwarder = run("api-forwarder.mjs", {
+    ...env, CODEX_ROUTER_API_PORT: String(forwarderPort),
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    ...env,
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${forwarderPort}/v1`,
+  });
+  const parameters = {
+    type: "object",
+    properties: { query: { type: "string" }, limit: { type: "integer" } },
+    required: ["query"], additionalProperties: false,
+  };
+  const fn = { type: "function", name: "lookup", strict: true, parameters };
+  const search = { type: "tool_search", execution: "client", parameters };
+  const custom = { type: "custom", name: "apply_patch", format: { type: "text" } };
+  const namespace = {
+    type: "namespace", name: "sample", description: "Native namespace",
+    tools: [{ type: "function", name: "lookup", parameters }],
+  };
+  const preview = { type: "web_search_preview", search_content_types: ["text"] };
+  const tools = [CODEX_WEB_SEARCH_TOOL, preview, fn, search, custom, namespace];
+  const original = structuredClone(tools);
+  const { search_content_types: _unsupported, ...repairedWeb } = CODEX_WEB_SEARCH_TOOL;
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const route of [paid, sibling]) {
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: route.slug, input: "test", tools }),
+      });
+      assert.equal(response.status, 200, `${router.testErrors()} ${forwarder.testErrors()}`);
+      await response.text();
+      const forwarded = received.at(-1);
+      assert.equal(forwarded.model, route.upstreamModel);
+      // Inspect the final provider body, after both router and forwarder.
+      // Keep optional function arguments, native tool kinds, and all other
+      // search options; only the measured paid model loses the refused field.
+      assert.deepEqual(forwarded.tools, [
+        route === paid ? repairedWeb : CODEX_WEB_SEARCH_TOOL,
+        preview,
+        { type: "function", name: "lookup", parameters },
+        { ...search, parameters: { ...parameters, required: ["query", "limit"] } },
+        custom,
+        namespace,
+      ]);
+    }
+    assert.equal(received.length, 2);
+    assert.deepEqual(tools, original);
+  } finally {
+    await stopChild(router);
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(testRoot, { recursive: true, force: true });
   }
 });
 

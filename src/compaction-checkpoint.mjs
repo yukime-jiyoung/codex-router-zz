@@ -1171,3 +1171,10 @@ export function finalizeCheckpoint(rawModelText, prepared) {
   };
   return normalizedCheckpoint(fitCheckpoint(checkpoint));
 }
+
+// Cross-provider compaction must fail before replacing history on invalid output.
+export function strictFinalizeCheckpoint(text, prepared) {
+  const candidate = modelObject(text);
+  if (modelContractErrors(candidate).length) throw Object.assign(new Error("Compaction summary is invalid; original history was retained."), {status:502, code:"invalid_compaction_summary"});
+  return finalizeCheckpoint(text, prepared);
+}

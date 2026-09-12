@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "opencode-zen-responses/muse-spark-1.3-contributor-free",
+      "gatewayModel": "opencode-zen-responses-muse-spark-1-3-contributor-free",
+      "upstreamModel": "muse-spark-1.3-contributor-free",
+      "provider": "opencode-zen-responses",
+      "listed": true,
+      "displayName": "Muse Spark 1.3 Contributor Free (OpenCode Zen)",
+      "description": "Muse Spark 1.3 Contributor Free through OpenCode Zen's Responses route. Measured 2026-09-10/11 against POST https://opencode.ai/zen/v1/responses for this exact model: a function tool carrying strict:true whose required omits an optional property is refused HTTP 400 and the identical schema without the flag returns 200, so this route drops the flag; any named tool_choice is refused because only \"auto\" is accepted, hence requestProfile auto-tool-choice; an input carrying a completed web_search_call is accepted and answered, hence supportsSearchHistory; a web_search tool is executed for real, returning web_search_call items with live queries and their results, hence searchTool standalone; and a tool whose parameters reference themselves through $ref is refused HTTP 400 while the same tool flattened returns 200, hence toolSchemaRecursion flatten. Context 1048576 and the reasoning ladder come from public models.dev metadata checked 2026-09-08 and are not independently verified. Prompts and completions may train Meta models; prior conversation and tool output can be included.",
+      "priority": 48,
+      "defaultEffort": "xhigh",
+      "reasoningLevels": [
+        {
+          "effort": "minimal",
+          "description": "minimal"
+        },
+        {
+          "effort": "low",
+          "description": "low"
+        },
+        {
+          "effort": "medium",
+          "description": "medium"
+        },
+        {
+          "effort": "high",
+          "description": "high"
+        },
+        {
+          "effort": "xhigh",
+          "description": "xhigh"
+        }
+      ],
+      "contextWindow": 1048576,
+      "autoCompact": 891289,
+      "inputModalities": [
+        "text",
+        "image"
+      ],
+      "isFree": true,
+      "requestProfile": "auto-tool-choice",
+      "toolSchemaRecursion": "flatten",
+      "toolStrictMode": "drop",
+      "supportsSearchHistory": true,
+      "searchTool": {
+        "mode": "standalone"
+      },
+      "compHash": "muse-free-zen-v3"
+    }
+  ]
+}

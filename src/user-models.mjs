@@ -70,6 +70,7 @@ const METADATA_FIELDS = new Set([
   "requiresTrailingUserTurn",
   "isFree",
   "toolSchemaRecursion",
+  "toolStrictMode",
   "supportedEndpoints",
 ]);
 

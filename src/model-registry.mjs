@@ -735,6 +735,19 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   ) {
     return `model ${model.slug} may only set toolSchemaRecursion to "flatten"`;
   }
+  // An upstream that enforces the OpenAI strict-mode precondition -- that
+  // `required` name every key in `properties` -- refuses every Codex tool
+  // that has an optional argument, and refuses the whole request rather than
+  // the one tool. Like the recursion field this describes the upstream's
+  // validator rather than anything the model can or cannot do, and it is
+  // separate from `requestProfile` for the same reason: the routes that need
+  // it already spend that single value on something else. `drop` is the only
+  // verb, because the other way to satisfy that validator -- filling
+  // `required` with every property -- makes the caller's optional arguments
+  // mandatory, which is a worse turn than the one it repairs.
+  if (model.toolStrictMode !== undefined && model.toolStrictMode !== "drop") {
+    return `model ${model.slug} may only set toolStrictMode to "drop"`;
+  }
   if (model.isFree !== undefined && typeof model.isFree !== "boolean") {
     return `model ${model.slug} has an invalid isFree flag`;
   }

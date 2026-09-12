@@ -183,6 +183,8 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go-responses/grok-4.6",
       "opencode-go-responses/muse-spark-1.2-contributor",
       "opencode-go-responses/muse-spark-1.3-contributor",
+      "opencode-zen-responses/muse-spark-1.3-contributor-free",
+      "opencode-zen-responses/muse-spark-1.3",
       "opencode-free-responses/muse-spark-1.3-contributor-free",
       "openrouter/claude-fable-5.1",
       "openrouter/gemini-3.8-flash",
@@ -286,7 +288,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(PROVIDERS.get("opencode-go-messages").variantOf, "opencode-go");
   assert.equal(PROVIDERS.get("opencode-go-responses").variantOf, "opencode-go");
   assert.equal(PROVIDERS.get("opencode-zen").variantOf, "opencode-go");
-  assert.equal(PROVIDERS.has("opencode-zen-responses"), false);
+  assert.equal(PROVIDERS.has("opencode-zen-responses"), true);
   assert.equal(PROVIDERS.get("commandcode").variantOf, undefined);
   assert.equal(PROVIDERS.get("commandcode-messages").variantOf, "commandcode");
   assert.equal(
@@ -615,6 +617,8 @@ test("provider registry exposes configured API and OAuth model families", () => 
     assert.deepEqual(MODEL_BY_SLUG.get(slug).searchTool, { mode: "hosted" });
   }
   const standaloneSearchSlugs = new Set([
+    "opencode-zen-responses/muse-spark-1.3",
+    "opencode-zen-responses/muse-spark-1.3-contributor-free",
     "deepseek/deepseek-v4-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
@@ -1341,6 +1345,53 @@ test("toolSchemaRecursion accepts only \"flatten\"", async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("toolStrictMode accepts only \"drop\"", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const nodePath = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(nodePath.join(tmpdir(), "registry-tool-strict-mode-test-"));
+  const load = (toolStrictMode) => {
+    const registry = readRegistryDocument("config");
+    registry.models = [
+      { ...registry.models[0], toolStrictMode },
+      ...registry.models.slice(1),
+    ];
+    const registryPath = nodePath.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    return spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+  };
+  try {
+    // The field names an executable behavior, so an unrecognized verb has to
+    // fail the load rather than be ignored into a route that keeps sending the
+    // flag its upstream refuses. `keep` is the plausible near-miss: it reads
+    // like an opt-out and would leave the turn broken in exactly the way this
+    // field exists to repair.
+    assert.match(load("keep").stderr, /may only set toolStrictMode to "drop"/);
+    assert.match(load(true).stderr, /may only set toolStrictMode to "drop"/);
+    assert.equal(load("drop").status, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The measurement is the paid Zen Responses route's own: a function tool
+// carrying `strict: true` whose `required` omits an optional property is
+// refused by POST https://opencode.ai/zen/v1/responses, and Codex sets that
+// flag on every tool it sends. The checked-in entry has to carry the repair or
+// the route 400s on every tool-bearing turn.
+test("the paid Zen Muse Spark route drops the strict tool flag", () => {
+  const model = MODELS.find(
+    (entry) => entry.slug === "opencode-zen-responses/muse-spark-1.3",
+  );
+  assert.ok(model, "expected the checked-in paid Zen Muse Spark 1.3 route");
+  assert.equal(model.toolStrictMode, "drop");
 });
 
 test("every Muse Spark route on opencode flattens recursive tool schemas", () => {

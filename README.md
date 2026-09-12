@@ -1,3 +1,66 @@
+# Extra models in Codex — measured, not declared
+
+*[日本語版はこちら](README.ja.md)*
+
+Adds non-OpenAI models to the model picker in the ChatGPT Codex app. Pick one from the same menu you already use, and switch back to GPT **mid-conversation**. No restart, no config edit, no separate toggle.
+
+Built on [codex-router](https://github.com/duolahypercho/codex-router) (MIT). What this fork adds: the OpenCode Zen route, the compatibility fixes it turned out to need, and a probe that finds such problems for you.
+
+## Why another one of these
+
+Most projects tell you a model "supports tools". Here is what that actually meant for one endpoint:
+
+| sent | got |
+|---|---|
+| function tool with `strict: true`, optional arg not in `required` | **400** |
+| same tool, `strict` removed | 200 |
+| `tool_choice` naming a function | **400** — only `"auto"` is accepted |
+| `stream_options` on a body with `stream: false` | **400** |
+| tool call whose `arguments` is `""` | **400** |
+| same call with `"{}"` | 200 |
+
+Measured 2026-09-11 against `muse-spark-1.3-contributor-free`. All six are fixed here.
+
+The fifth one is the reason this project exists. Codex records a no-argument tool call as `arguments: ""`. OpenAI accepts it; this endpoint does not. That item is replayed on every later turn, so **one such call ends the conversation permanently** — and from the app it just looks like it broke.
+
+## Check it yourself
+
+```sh
+node tools/compat-probe/probe.mjs --model <provider>/<model> --tier full
+```
+
+Sends controlled pairs: two requests differing in exactly one field, so the result tells you which field moved the boundary. Writes a route definition with the evidence attached — what was sent, what came back, and what the control did.
+
+It also catches the quiet failures. A parameter the endpoint accepts and then discards returns 200 and passes any test that only reads the status line, so each parameter is paired with a task whose output changes when it takes effect. A control that shows the same effect means "always on", not "ignored" — conflating those two reports a working endpoint as broken.
+
+## Switching mid-conversation
+
+A model's reasoning is encrypted and cannot be handed to another vendor, so a naive switch drops the thread. Here the running summary is rewritten into a form both models can read.
+
+Verified end to end: GPT picked a random 4-digit number and specified a file; after switching, the other model produced that exact file; switching back, GPT verified it. Nobody typed the number. Three automatic summaries ran in between and it survived all of them.
+
+## Install
+
+Node 24+. macOS, Linux, Windows.
+
+```sh
+git clone https://github.com/suzukitakumi-hub/omc-codex.git
+cd omc-codex && ./install.sh codex
+```
+
+## Read this before you use the free tier
+
+- **Prompts and completions may be used for training.** Including prior conversation and tool output. Keep confidential work off it.
+- **No cost, but no known ceiling either.** `429` happens. The actual limit and reset window are undetermined.
+- **Not everything is verified.** The 1M context figure comes from public metadata; 220k tokens is what was actually confirmed. `tool_choice: "none"` is still refused and unhandled.
+- **Some providers restrict proxied traffic.** This protects you from nothing — not their terms, not rate limits, not account action. Not affiliated with any provider.
+
+## Credit
+
+[codex-router](https://github.com/duolahypercho/codex-router) — MIT, Copyright (c) 2026 codex-router contributors. The proxy, the service management on all three platforms, and support for ~40 providers are its work, not mine.
+
+---
+
 # Codex Router
 
 ## Install everything (recommended)

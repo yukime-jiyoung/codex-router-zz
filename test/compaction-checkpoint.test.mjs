@@ -7,6 +7,7 @@ import {
   decodeCompaction,
   encodeCheckpoint,
   finalizeCheckpoint,
+  strictFinalizeCheckpoint,
   KCR1_PREFIX,
   KCR2_PREFIX,
   LEGACY_V1_SUMMARY_PREFIX,
@@ -776,4 +777,13 @@ test("encoding degrades to a minimal checkpoint instead of throwing", () => {
     assert.match(rendered, /BEGIN_CODEX_ROUTER_CHECKPOINT_V2/u);
     assert.match(rendered, /could not encode a checkpoint/u);
   }
+});
+
+test("portable compaction refuses malformed summaries before replacing history", () => {
+  const input=[message("user","preserve this requirement")];
+  const prepared=prepareCompaction(input);
+  assert.throws(()=>strictFinalizeCheckpoint("plain prose",prepared),/original history was retained/);
+  const text=JSON.stringify({objective:"continue",requirement_refs:["U001"],attempt_refs:[],observation_refs:[],unverified:[],unknowns:[],blockers:[],next_step:"verify"});
+  assert.match(JSON.stringify(strictFinalizeCheckpoint(text,prepared)),/preserve this requirement/);
+  assert.equal(input[0].content[0].text,"preserve this requirement");
 });
