@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { isMuseFree, museFreeHeaders, museFreePreflight, museFreeSessionId, MUSE_FREE_ID } from "../src/muse-free.mjs";
 import { museFreeOutputMarker, museFreePortableInput } from "../src/muse-free.mjs";
@@ -72,8 +73,13 @@ test("exact route and strict thread identity; no credential/header leakage", () 
 });
 
 test("real router + real API forwarder, loopback upstream: model switches, tool wire roundtrip and failures", { timeout: 180000 }, async () => {
-  const root = path.resolve(process.env.MUSE_TEST_ROOT);
-  assert.ok(root.includes("work"));
+  // A caller may point this somewhere durable to inspect what the run wrote;
+  // otherwise the test owns a fresh temporary directory. Requiring the variable
+  // made this test pass only on the machine that happened to export it, and
+  // fail on every checkout that did not -- including all three CI platforms.
+  const root = process.env.MUSE_TEST_ROOT
+    ? path.resolve(process.env.MUSE_TEST_ROOT)
+    : mkdtempSync(path.join(os.tmpdir(), "muse-free-"));
   const state = path.join(root, "state");
   mkdirSync(state, { recursive: true });
   writeFileSync(path.join(state, "user-models.json"), JSON.stringify({ version: 1, models: [free] }));
