@@ -10,18 +10,24 @@ Built on [codex-router](https://github.com/duolahypercho/codex-router) (MIT). Wh
 
 Most projects tell you a model "supports tools". Here is what that actually meant for one endpoint:
 
-| sent | got |
-|---|---|
-| function tool with `strict: true`, optional arg not in `required` | **400** |
-| same tool, `strict` removed | 200 |
-| `tool_choice` naming a function | **400** — only `"auto"` is accepted |
-| `stream_options` on a body with `stream: false` | **400** |
-| tool call whose `arguments` is `""` | **400** |
-| same call with `"{}"` | 200 |
+| sent | got | what this fork does |
+|---|---|---|
+| function tool with `strict: true`, optional arg not in `required` | **400** | drops the flag |
+| the same tool without `strict` | 200 | — |
+| tool whose parameters reference themselves through `$ref` | **400** | flattens the schema |
+| `tool_choice` naming a function | **400** — only `"auto"` is accepted | rewrites it to `"auto"` |
+| `tool_choice: "none"` | **400** | **nothing — still unhandled** |
+| freeform `custom` tool, which is how Codex ships `apply_patch` | **400** | presents it as a function tool, and restores the custom shape on the way back |
+| `stream_options` on a body with `stream: false` | **400** | strips it |
+| tool call whose `arguments` is `""` | **400** | rewrites it to `"{}"` |
+| the same call with `"{}"` | 200 | — |
+| a `web_search` tool | 200 — **and it really searches** | enabled for this route |
+| a completed `web_search_call` replayed in history | 200 | kept |
+| ~220k tokens of input | 200 | — |
 
-Measured 2026-09-11 against `muse-spark-1.3-contributor-free`. All six are fixed here.
+Measured 2026-09-11 against `muse-spark-1.3-contributor-free`. Seven refusals, six handled here. The seventh, `tool_choice: "none"`, is not — see the caveats below.
 
-The fifth one is the reason this project exists. Codex records a no-argument tool call as `arguments: ""`. OpenAI accepts it; this endpoint does not. That item is replayed on every later turn, so **one such call ends the conversation permanently** — and from the app it just looks like it broke.
+The empty-`arguments` row is the reason this project exists. Codex records a no-argument tool call as `arguments: ""`. OpenAI accepts it; this endpoint does not. That item is replayed on every later turn, so **one such call ends the conversation permanently** — and from the app it just looks like it broke.
 
 ## Check it yourself
 
@@ -52,7 +58,8 @@ cd omc-codex && ./install.sh codex
 
 - **Prompts and completions may be used for training.** Including prior conversation and tool output. Keep confidential work off it.
 - **No cost, but no known ceiling either.** `429` happens. The actual limit and reset window are undetermined.
-- **Not everything is verified.** The 1M context figure comes from public metadata; 220k tokens is what was actually confirmed. `tool_choice: "none"` is still refused and unhandled.
+- **Not everything is verified.** The 1M context figure comes from public metadata; 220k tokens is what was actually confirmed.
+- **One measured refusal is left unhandled.** `tool_choice: "none"` is rejected by this endpoint and nothing here rewrites it, because ~100 turns on the paid route never produced one. If Codex starts sending it, this breaks and the fix is the same shape as the others.
 - **Some providers restrict proxied traffic.** This protects you from nothing — not their terms, not rate limits, not account action. Not affiliated with any provider.
 
 ## Credit
