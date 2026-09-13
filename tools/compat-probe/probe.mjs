@@ -2,6 +2,7 @@
 // trusting what a catalog says about it.
 //
 //   node probe.mjs --model <slug> [--tier smoke|full] [--dry-run] [--only ID,ID]
+//   node probe.mjs --model <provider>/<id> --candidate    # not registered yet
 //
 // Credentials are resolved the way the router resolves them and are never
 // printed, logged, or written to an artifact.
@@ -47,10 +48,36 @@ const withSequences = has("sequences") || tier !== "smoke";
 const registry = await import(
   pathToFileURL(path.join(SOURCE_ROOT, "src", "model-registry.mjs")).href,
 );
+// A model has to be measured before it is worth registering, and the point of
+// this tool is to answer that question first. `--candidate` reads the slug as
+// the provider id `discover-models` prints plus the upstream id it reported,
+// so a model nothing has declared yet can still be probed. It stays behind a
+// flag because without one a mistyped registered slug would silently become a
+// candidate and be sent to the endpoint instead of refused here.
+const candidate = has("candidate");
 const model = registry.MODEL_BY_SLUG.get(modelSlug);
-if (!model) throw new Error(`unknown model: ${modelSlug}`);
-const provider = registry.providerForModel(model);
-if (!provider) throw new Error(`no provider for ${modelSlug}`);
+if (!model && !candidate) {
+  throw new Error(
+    `unknown model: ${modelSlug}. `
+    + `Pass --candidate to probe a model that is not registered yet.`,
+  );
+}
+const [candidateProvider, ...candidateRest] = modelSlug.split("/");
+const provider = model
+  ? registry.providerForModel(model)
+  : registry.PROVIDERS.get(candidateProvider);
+if (!provider) {
+  throw new Error(
+    model
+      ? `no provider for ${modelSlug}`
+      : `unknown provider: ${candidateProvider}. Expected <provider>/<model>.`,
+  );
+}
+// An unregistered candidate has no declared capabilities, and guessing them is
+// exactly the habit this tool exists to replace. It carries the upstream id and
+// nothing else, so every capability in the report is one the endpoint answered.
+const route = model ?? { provider: provider.id, upstreamModel: candidateRest.join("/") };
+if (!route.upstreamModel) throw new Error(`no model id in ${modelSlug}. Expected <provider>/<model>.`);
 
 function credential() {
   for (const name of provider.credential?.environment ?? []) {
@@ -71,14 +98,21 @@ function credential() {
 const KEY = dryRun ? "" : credential();
 const SECRETS = KEY ? [KEY] : [];
 const BASE_URL = provider.baseUrl;
-// Responses and Chat Completions are different surfaces with different paths.
-// The route's own protocol decides which one is probed, so a Chat Completions
-// provider is not silently measured against an endpoint it does not serve.
-const ENDPOINT_PATH = provider.protocol === "openai-responses" || provider.protocol === undefined
-  ? "/responses"
-  : "/chat/completions";
+// Every request this probe builds is Responses-shaped -- `input`, `store`,
+// `max_output_tokens` -- and every assertion reads a Responses event stream.
+// An absent protocol means Chat Completions, the registry's default, not
+// Responses; sending these bodies there returns a 500 that has nothing to do
+// with the behaviour under test. Refusing beats reporting that as a finding.
+if (provider.protocol !== "openai-responses") {
+  throw new Error(
+    `${provider.id} serves ${provider.protocol ?? "Chat Completions"}, and this probe measures `
+    + `the Responses surface. Probe the provider's Responses route instead `
+    + `(for example opencode-zen-responses rather than opencode-zen).`,
+  );
+}
+const ENDPOINT_PATH = "/responses";
 const ENDPOINT = {
-  fingerprint: fingerprint({ baseUrl: BASE_URL, endpointPath: ENDPOINT_PATH, protocol: provider.protocol, model: model.upstreamModel }),
+  fingerprint: fingerprint({ baseUrl: BASE_URL, endpointPath: ENDPOINT_PATH, protocol: provider.protocol, model: route.upstreamModel }),
   base_url_host: (() => { try { return new URL(BASE_URL).host; } catch { return BASE_URL; } })(),
   path: ENDPOINT_PATH,
   protocol: provider.protocol ?? "openai",
@@ -120,7 +154,7 @@ function parseJson(text) {
 let sent = 0;
 async function send(body) {
   const payload = {
-    model: model.upstreamModel,
+    model: route.upstreamModel,
     stream: true,
     store: false,
     // A cap keeps a probe cheap, but it also truncates the very output some
@@ -221,7 +255,7 @@ const sequences = withSequences && !only?.length ? SEQUENCES : [];
 const planned = selected.length * 2 + sequences.reduce((n, s) => n + 1 + s.variants.length, 0);
 
 console.log(`endpoint : ${ENDPOINT.base_url_host}${ENDPOINT.path}  (${ENDPOINT.fingerprint})`);
-console.log(`model    : ${modelSlug}  →  ${model.upstreamModel}`);
+console.log(`model    : ${modelSlug}  →  ${route.upstreamModel}`);
 console.log(`tier     : ${tier}   tests: ${selected.length}   sequences: ${sequences.length}`);
 console.log(`requests : ${planned} 件（直列、上限256トークン、store=false、ツールは定義するのみで実行しない）`);
 if (dryRun) { console.log("\n--dry-run のため送信しません。"); process.exit(0); }
@@ -245,7 +279,7 @@ for (const test of selected) {
   // A と B が同じなら、その課題ではこの変数は何も変えていない。
   const indistinguishable = outcomeA === outcomeB && test.observe.kind === "effect";
   const record = buildRecord({
-    test, endpoint: ENDPOINT, model: modelSlug, accountTier: model.isFree ? "free" : null,
+    test, endpoint: ENDPOINT, model: modelSlug, accountTier: route.isFree ? "free" : null,
     variantA: { label: test.a.label, outcome: outcomeA, http_status: a.status, ms: a.ms },
     variantB: { label: test.b.label, outcome: outcomeB, http_status: b.status, ms: b.ms,
                 excerpt: b.status >= 400 ? scrub(b.raw, SECRETS) : undefined },
@@ -295,7 +329,7 @@ for (const seq of sequences) {
     const record = buildRecord({
       test: { ...seq, id: `${seq.id}#${variant.label.replace(/\s+/g, "_")}`,
               feature: `${seq.feature}.${variant.label.replace(/\s+/g, "_")}` },
-      endpoint: ENDPOINT, model: modelSlug, accountTier: model.isFree ? "free" : null,
+      endpoint: ENDPOINT, model: modelSlug, accountTier: route.isFree ? "free" : null,
       variantA: { label: "elicited from the model itself", outcome: OUTCOME.ACCEPTED_HONORED, http_status: elicited.status },
       variantB: { label: variant.label, outcome, http_status: replayed.status,
                   excerpt: replayed.status >= 400 ? scrub(replayed.raw, SECRETS) : undefined },

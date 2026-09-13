@@ -61,6 +61,28 @@ test("an unknown model is refused rather than probed", { timeout: 60000 }, async
   const { code, out, err } = await run(["--model", "opencode-zen-responses/not-a-model", "--dry-run"]);
   assert.notEqual(code, 0, `expected a refusal, got:\n${out}`);
   assert.match(err, /unknown model/, err);
+  assert.match(err, /--candidate/, "the refusal says how to probe something unregistered");
+});
+
+// Measuring a model before registering it is the order this tool exists to
+// enforce, so an unregistered id is probeable -- but only when asked for, so a
+// mistyped registered slug still stops here instead of reaching the endpoint.
+test("--candidate probes a model the registry has never heard of", { timeout: 60000 }, async () => {
+  const { code, out, err } = await run([
+    "--model", "opencode-zen-responses/not-registered-yet", "--candidate", "--dry-run",
+  ]);
+  assert.equal(code, 0, `probe exited ${code}\n${err}`);
+  assert.match(out, /not-registered-yet/, "the candidate id reaches the request plan");
+});
+
+// Every body this probe builds is Responses-shaped and every assertion reads a
+// Responses event stream. An absent protocol means Chat Completions, so aiming
+// it at one returns a 500 that says nothing about the behaviour under test.
+test("a Chat Completions provider is refused, not measured against /responses", { timeout: 60000 }, async () => {
+  const { code, err } = await run(["--model", "opencode-zen/big-pickle", "--candidate", "--dry-run"]);
+  assert.notEqual(code, 0, "expected a refusal");
+  assert.match(err, /Responses surface/, err);
+  assert.match(err, /opencode-zen-responses/, "the refusal names the route to use instead");
 });
 
 // Not a dry run: the credential is resolved before the first request is built,
