@@ -8,7 +8,7 @@
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { OUTCOME, buildRecord, fingerprint, save, scrub, toProfile } from "./record.mjs";
 import { SEQUENCES, TESTS, selectTests } from "./catalog.mjs";
@@ -40,7 +40,13 @@ const dryRun = has("dry-run");
 const withSequences = has("sequences") || tier !== "smoke";
 
 // ── endpoint と資格情報の解決 ────────────────────────────────────
-const registry = await import(`file:///${SOURCE_ROOT.replaceAll("\\", "/")}/src/model-registry.mjs`);
+// pathToFileURL, not a hand-built file:// string: prefixing a POSIX root with
+// "file:///" produces four slashes and a path that starts "//", which is not
+// the same path on every platform. It also escapes a space or a "#" in the
+// repository path, which a template literal leaves to break the import.
+const registry = await import(
+  pathToFileURL(path.join(SOURCE_ROOT, "src", "model-registry.mjs")).href,
+);
 const model = registry.MODEL_BY_SLUG.get(modelSlug);
 if (!model) throw new Error(`unknown model: ${modelSlug}`);
 const provider = registry.providerForModel(model);
