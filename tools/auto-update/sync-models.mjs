@@ -199,7 +199,7 @@ function run(args) {
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
-const summary = { checked: 0, candidates: 0, added: [], rejected: [], deferred: [], gone: [], errors: [] };
+const summary = { checked: 0, candidates: 0, added: [], rejected: [], deferred: [], gone: [], unreachable: [], errors: [] };
 
 for (const provider of providersInScope()) {
   summary.checked += 1;
@@ -207,8 +207,20 @@ for (const provider of providersInScope()) {
   try {
     found = await discovery.discoverProviderModels(provider.id, { refresh: true });
   } catch (error) {
-    summary.errors.push({ provider: provider.id, why: String(error.message) });
-    say(`error  ${provider.id}: ${error.message}`);
+    // A provider that is not answering is not a problem to report every week.
+    // A local model server is off more often than on, and a network that was
+    // down at 9am on Monday is not a defect in anything here. Unreachable is a
+    // skip; anything else is an error, because an error should mean somebody
+    // has to look at it.
+    const unreachable = /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket hang up|network/i
+      .test(error.message ?? "");
+    if (unreachable) {
+      summary.unreachable.push({ provider: provider.id, why: String(error.message) });
+      say(`skip   ${provider.id}: not answering (${error.message})`);
+    } else {
+      summary.errors.push({ provider: provider.id, why: String(error.message) });
+      say(`error  ${provider.id}: ${error.message}`);
+    }
     continue;
   }
 
@@ -292,7 +304,8 @@ if (asJson) {
 } else {
   say("");
   say(`providers ${summary.checked}  candidates ${summary.candidates}  added ${summary.added.length}  `
-    + `rejected ${summary.rejected.length}  deferred ${summary.deferred.length}  no longer served ${summary.gone.length}`);
+    + `rejected ${summary.rejected.length}  deferred ${summary.deferred.length}  `
+    + `unreachable ${summary.unreachable.length}  no longer served ${summary.gone.length}`);
   if (!apply && summary.added.length) say("Report only. Pass --apply to add them.");
   if (apply && summary.added.length) say("They appear in the picker the next time Codex starts.");
 }
