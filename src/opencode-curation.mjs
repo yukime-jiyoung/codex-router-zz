@@ -287,9 +287,25 @@ const CURATION_ROUTES = Object.freeze({
       "muse-spark-1.3-contributor",
     ]),
     primaryModels: Object.freeze([
+      // Measured 2026-09-14 against POST https://opencode.ai/zen/go/v1 for both
+      // ids: each answers a Chat Completions turn, reasons through a two-step
+      // arithmetic prompt correctly, and emits a well-formed `tool_calls` entry
+      // for a function tool. Neither answers on /responses. They are separate
+      // routes rather than aliases -- the same request returns a `chatcmpl-`
+      // id from `deepseek-v4.1-flash` and a UUID from `deepseek-flash`, so two
+      // different backends serve them.
+      //
+      // They sit next to two ids that this account cannot reach at all:
+      // `deepseek-v4-flash` and `deepseek-v4-pro` answer HTTP 403 RegionError,
+      // because their current version is hosted only in China and needs an
+      // explicit workspace opt-in. Those entries stay listed -- an account that
+      // has opted in reaches them -- but they are the reason a picker entry is
+      // worth measuring from the machine that will use it.
+      "deepseek-flash",
       "deepseek-v4-flash",
       "deepseek-v4-flash-vision-exp",
       "deepseek-v4-pro",
+      "deepseek-v4.1-flash",
       "glm-5",
       "glm-5.1",
       "glm-5.2",
