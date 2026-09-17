@@ -27,6 +27,8 @@ Most projects tell you a model "supports tools". Here is what that actually mean
 
 Measured 2026-09-11 against `muse-spark-1.3-contributor-free`. Seven refusals, six handled here. The seventh, `tool_choice: "none"`, is not — see the caveats below.
 
+> **2026-09-17.** OpenCode has closed its free tier to third-party clients (`OpenCode's free tier can only be used from within OpenCode`, HTTP 403). The table above measured the free route; the paid `muse-spark-1.3` was measured again on 2026-09-17 and behaves identically, so the route configuration still holds — the model you pick changes, not the fixes.
+
 The empty-`arguments` row is the reason this project exists. Codex records a no-argument tool call as `arguments: ""`. OpenAI accepts it; this endpoint does not. That item is replayed on every later turn, so **one such call ends the conversation permanently** — and from the app it just looks like it broke.
 
 ## Check it yourself
@@ -50,14 +52,15 @@ Verified end to end: GPT picked a random 4-digit number and specified a file; af
 Node 24+. macOS, Linux, Windows.
 
 ```sh
-git clone https://github.com/suzukitakumi-hub/omc-codex.git
-cd omc-codex && ./install.sh codex
+git clone https://github.com/yukime-jiyoung/codex-router-zz.git
+cd codex-router-zz && ./install.sh codex
 ```
 
 ## Read this before you use the free tier
 
-- **Prompts and completions may be used for training.** Including prior conversation and tool output. Keep confidential work off it.
-- **No cost, but no known ceiling either.** `429` happens. The actual limit and reset window are undetermined.
+- **The free tier no longer answers third-party clients.** As of 2026-09-17 OpenCode refuses it with HTTP 403; it worked until 2026-09-14. The paid `muse-spark-1.3` runs on the same route configuration.
+- **The discounted `contributor` models need a Go subscription.** They exist only on the Go endpoint, and a Zen balance alone does not reach them. They also require an explicit opt-in.
+- **Prompts and completions may be used for training** on any `contributor` model. Including prior conversation and tool output. Keep confidential work off it.
 - **Not everything is verified.** The 1M context figure comes from public metadata; 220k tokens is what was actually confirmed.
 - **One measured refusal is left unhandled.** `tool_choice: "none"` is rejected by this endpoint and nothing here rewrites it, because ~100 turns on the paid route never produced one. If Codex starts sending it, this breaks and the fix is the same shape as the others.
 - **Some providers restrict proxied traffic.** This protects you from nothing — not their terms, not rate limits, not account action. Not affiliated with any provider.
